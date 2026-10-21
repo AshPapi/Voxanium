@@ -1,0 +1,58 @@
+package me.cortex.voxy.client;
+
+import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.commonImpl.ImportManager;
+import me.cortex.voxy.commonImpl.importers.IDataImporter;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.LerpingBossEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.BossEvent;
+
+import java.util.UUID;
+
+public class ClientImportManager extends ImportManager {
+    protected class ClientImportTask extends ImportTask {
+        private final UUID bossbarUUID;
+        private final LerpingBossEvent bossBar;
+        protected ClientImportTask(IDataImporter importer) {
+            super(importer);
+
+            this.bossbarUUID = UUID.randomUUID();
+            this.bossBar = new LerpingBossEvent(this.bossbarUUID, Component.translatable("voxy.import.bossbar.title"), 0.0f, BossEvent.BossBarColor.GREEN, BossEvent.BossBarOverlay.PROGRESS, false, false, false);
+            Minecraft.getInstance().execute(()->{
+                Minecraft.getInstance().gui.hud.getBossOverlay().events.put(bossBar.getId(), bossBar);
+            });
+        }
+
+        @Override
+        protected boolean onUpdate(int completed, int outOf) {
+            if (!super.onUpdate(completed, outOf)) {
+                return false;
+            }
+            Minecraft.getInstance().execute(()->{
+                this.bossBar.setProgress((float) (((double)completed) / ((double) Math.max(1, outOf))));
+                this.bossBar.setName(Component.translatable("voxy.import.bossbar.progress", completed, outOf));
+            });
+            return true;
+        }
+
+        @Override
+        protected void onCompleted(int total) {
+            super.onCompleted(total);
+            Minecraft.getInstance().execute(()->{
+                Minecraft.getInstance().gui.hud.getBossOverlay().events.remove(this.bossbarUUID);
+                long delta = Math.max(System.currentTimeMillis() - this.startTime, 1);
+
+                long seconds = delta/1000;
+                int chunksPerSecond = (int)(total/(delta/1000f));
+                Minecraft.getInstance().gui.hud.getChat().addClientSystemMessage(Component.translatable("voxy.import.finished", seconds, chunksPerSecond));
+                Logger.info("Voxy world import finished in " + seconds + " seconds, averaging " + chunksPerSecond + " chunks per second");
+            });
+        }
+    }
+
+    @Override
+    protected synchronized ImportTask createImportTask(IDataImporter importer) {
+        return new ClientImportTask(importer);
+    }
+}

@@ -1,0 +1,57 @@
+{
+  "voxy.config.title": "Voxy",
+
+  "voxy.config.general": "Общие",
+  "voxy.config.rendering": "Отрисовка",
+
+  "voxy.config.general.enabled": "Включить Voxy",
+  "voxy.config.general.enabled.tooltip": "Полностью включает или выключает Voxy",
+
+  "voxy.config.general.serviceThreads": "Служебные потоки",
+  "voxy.config.general.serviceThreads.tooltip": "Сколько потоков может использовать пул служебных потоков Voxy",
+
+  "voxy.config.general.useSodiumBuilder": "Потоки Sodium",
+  "voxy.config.general.useSodiumBuilder.tooltip": "Добавляет потоки сборки Sodium в пул потоков Voxy. Может уменьшить подтормаживания и лаги при быстром движении на большой дальности прорисовки",
+
+  "voxy.config.general.ingest": "Обработка чанков",
+  "voxy.config.general.ingest.tooltip": "Включает или выключает превращение новых чанков в LOD",
+
+  "voxy.config.general.rendering": "Отрисовка Voxy",
+  "voxy.config.general.rendering.tooltip": "Включает или выключает отрисовку Voxy",
+
+  "voxy.config.general.subDivisionSize": "Порог разбиения (пиксели²)",
+  "voxy.config.general.subDivisionSize.tooltip": "Наибольший размер области LOD на экране в пикселях (в квадрате), после которого она делится на более мелкие LOD. Чем меньше значение, тем выше качество",
+
+  "voxy.config.general.renderDistance": "Дальность прорисовки",
+  "voxy.config.general.renderDistance.tooltip": "Дальность прорисовки Voxy в чанках",
+
+  "voxy.config.general.environmental_fog": "Туман и затухание",
+  "voxy.config.general.environmental_fog.tooltip": "Настраивает туман и плавное затухание мира вдали",
+  "voxy.config.general.environmental_fog.fog_and_fade": "Туман и затухание",
+  "voxy.config.general.environmental_fog.fog": "Только туман",
+  "voxy.config.general.environmental_fog.fade": "Только затухание",
+  "voxy.config.general.environmental_fog.off": "Выкл.",
+
+  "voxy.config.general.ssao_mode": "Режим SSAO",
+  "voxy.config.general.ssao_mode.tooltip": "Режим экранного затенения (SSAO). «Авто» старается выбрать лучший вариант и не сильно снижать производительность",
+  "voxy.config.general.ssao_mode.auto": "Авто",
+  "voxy.config.general.ssao_mode.basic": "Простой",
+  "voxy.config.general.ssao_mode.better": "Хороший",
+  "voxy.config.general.ssao_mode.best": "Лучший",
+
+  "voxy.command.not_enabled": "Чтобы использовать это, включите Voxy в настройках",
+  "voxy.command.singleplayer_only": "Эта команда работает только в одиночной игре",
+  "voxy.command.import.no_region_folder": "Не удалось найти папку region для текущего измерения",
+
+  "voxy.import.bossbar.title": "Импорт мира Voxy",
+  "voxy.import.bossbar.progress": "Импорт Voxy: обработано чанков %s/%s",
+  "voxy.import.finished": "Импорт мира Voxy завершён. Время: %s с, средняя скорость: %s чанков/с",
+
+  "voxy.warning.low_render_distance": "Voxy: при дальности прорисовки игры 2 у краёв экрана иногда может пропадать часть мира. Поставьте 3 или больше",
+
+  "voxy.debug.verify.start": "Начата проверка дочерних масок узлов верхнего уровня",
+  "voxy.debug.verify.start_repair": "Начата проверка дочерних масок узлов верхнего уровня, ошибки будут исправлены",
+  "voxy.debug.verify.complete": "Проверка завершена",
+
+  "neoforge.screen.mods.info.description.voxy": "Мод для отрисовки мира на большом расстоянии с помощью LOD"
+}

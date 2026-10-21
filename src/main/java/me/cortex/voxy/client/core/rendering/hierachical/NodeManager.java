@@ -1,0 +1,1430 @@
+package me.cortex.voxy.client.core.rendering.hierachical;
+
+import it.unimi.dsi.fastutil.ints.IntConsumer;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntSet;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
+import me.cortex.voxy.client.core.gl.GlBuffer;
+import me.cortex.voxy.client.core.rendering.ISectionWatcher;
+import me.cortex.voxy.client.core.rendering.building.BuiltSection;
+import me.cortex.voxy.client.core.rendering.section.geometry.IGeometryManager;
+import me.cortex.voxy.client.core.rendering.util.UploadStream;
+import me.cortex.voxy.client.core.util.ExpandingObjectAllocationList;
+import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.common.util.MemoryBuffer;
+import me.cortex.voxy.common.world.WorldEngine;
+import org.lwjgl.system.MemoryUtil;
+
+import java.util.List;
+
+import static me.cortex.voxy.common.world.WorldEngine.MAX_LOD_LAYER;
+import static me.cortex.voxy.common.world.WorldEngine.UPDATE_TYPE_BLOCK_BIT;
+
+
+public class NodeManager {
+    private static final boolean VERIFY_NODE_MANAGER_OPERATIONS = true;
+
+    public static final int NULL_GEOMETRY_ID = -1;
+    public static final int EMPTY_GEOMETRY_ID = -2;
+    public static final int NULL_REQUEST_ID = NodeStore.REQUEST_ID_MSK;
+    public static final int SENTINEL_EMPTY_CHILD_PTR = NodeStore.NODE_ID_MSK-1;
+
+    public static final int NODE_ID_MSK = ((1<<24)-1);
+    private static final int NODE_TYPE_MSK = 0b11<<30;
+    private static final int NODE_TYPE_LEAF = 0b00<<30;
+    private static final int NODE_TYPE_INNER = 0b01<<30;
+    private static final int NODE_TYPE_REQUEST = 0b10<<30;
+
+    private static final int REQUEST_TYPE_SINGLE = 0b0<<29;
+    private static final int REQUEST_TYPE_CHILD = 0b1<<29;
+    private static final int REQUEST_TYPE_MSK = 0b1<<29;
+
+    private final ExpandingObjectAllocationList<SingleNodeRequest> singleRequests = new ExpandingObjectAllocationList<>(SingleNodeRequest[]::new, NodeStore.REQUEST_ID_MSK);
+    private final ExpandingObjectAllocationList<NodeChildRequest> childRequests = new ExpandingObjectAllocationList<>(NodeChildRequest[]::new, NodeStore.REQUEST_ID_MSK);
+    private final IntOpenHashSet nodeUpdates = new IntOpenHashSet();
+    private final IGeometryManager geometryManager;
+    private final ISectionWatcher watcher;
+    private final Long2IntOpenHashMap activeSectionMap = new Long2IntOpenHashMap();
+    private final NodeStore nodeData;
+    public final int maxNodeCount;
+    private final IntOpenHashSet topLevelNodeIds = new IntOpenHashSet();
+    private final LongOpenHashSet topLevelNodes = new LongOpenHashSet();
+    private int activeNodeRequestCount;
+
+    private IntConsumer topLevelNodeIdAddedCallback;
+    private IntConsumer topLevelNodeIdRemovedCallback;
+
+    public interface ICleaner {
+        void alloc(int id);
+        void move(int from, int to);
+        void free(int id);
+    }
+    private ICleaner cleanerInterface;
+    public void setClear(ICleaner callback) {this.cleanerInterface = callback;}
+    private void clearAllocId(int id) { if (this.cleanerInterface != null) this.cleanerInterface.alloc(id); }
+    private void clearMoveId(int from, int to) { if (this.cleanerInterface != null) this.cleanerInterface.move(from, to); }
+    private void clearFreeId(int id) { if (this.cleanerInterface != null) this.cleanerInterface.free(id); }
+
+    public void setTLNCallbacks(IntConsumer onAdd, IntConsumer onRemove) {
+        this.topLevelNodeIdAddedCallback = onAdd;
+        this.topLevelNodeIdRemovedCallback = onRemove;
+    }
+
+    public NodeManager(int maxNodeCount, IGeometryManager geometryManager, ISectionWatcher watcher) {
+        if ((maxNodeCount&(maxNodeCount-1))!=0) {
+            throw new IllegalArgumentException("Max node count must be a power of 2");
+        }
+        if (maxNodeCount>(1<<24)) {
+            throw new IllegalArgumentException("Max node count cannot exceed 2^24");
+        }
+        this.activeSectionMap.defaultReturnValue(-1);
+        this.watcher = watcher;
+        this.maxNodeCount = maxNodeCount;
+        this.nodeData = new NodeStore(maxNodeCount);
+        this.geometryManager = geometryManager;
+    }
+
+    private static void assertPosValid(long pos) {
+        int lvl = WorldEngine.getLevel(pos);
+        int x = WorldEngine.getX(pos);
+        int y = WorldEngine.getY(pos);
+        int z = WorldEngine.getZ(pos);
+        if (WorldEngine.getWorldSectionId(lvl, x, y, z) != pos) {
+            throw new IllegalStateException("Reconstructed pos not same as original");
+        }
+        x <<= lvl;
+        y <<= lvl;
+        z <<= lvl;
+        long p2 = WorldEngine.getWorldSectionId(0, x, y, z);
+        if (WorldEngine.getLevel(p2) != 0 || WorldEngine.getX(p2) != x || WorldEngine.getY(p2) != y || WorldEngine.getZ(p2) != z) {
+            throw new IllegalStateException("Position not valid at all levels: " + pos + "-"+WorldEngine.pprintPos(pos) + ":"+WorldEngine.pprintPos(p2));
+        }
+    }
+
+    public void insertTopLevelNode(long pos) {
+        assertPosValid(pos);
+
+        if (this.activeSectionMap.containsKey(pos)) {
+            Logger.error("Tried inserting top level pos " + WorldEngine.pprintPos(pos) + " but it was in active map, discarding!");
+            return;
+        }
+
+        var request = new SingleNodeRequest(pos);
+        int id = this.singleRequests.put(request);
+        this.watcher.watch(pos, WorldEngine.DEFAULT_UPDATE_FLAGS);
+        this.activeSectionMap.put(pos, id|NODE_TYPE_REQUEST|REQUEST_TYPE_SINGLE);
+        this.topLevelNodes.add(pos);
+    }
+
+    public void removeTopLevelNode(long pos) {
+        if (!this.topLevelNodes.remove(pos)) {
+            throw new IllegalStateException("Position not in top level map: " + WorldEngine.pprintPos(pos));
+        }
+        int nodeId = this.activeSectionMap.get(pos);
+        if (nodeId == -1) {
+            throw new IllegalStateException("Tried removing top level pos " + WorldEngine.pprintPos(pos) + " but it was not in active map, discarding!");
+        }
+        if ((nodeId&NODE_TYPE_MSK)!=NODE_TYPE_REQUEST) {
+            int id = nodeId&NODE_ID_MSK;
+            if (!this.topLevelNodeIds.remove(id)) {
+                throw new IllegalStateException("Node id was not in top level node ids: " + nodeId + " pos: " + WorldEngine.pprintPos(pos));
+            }
+            if (this.topLevelNodeIdRemovedCallback != null)
+                this.topLevelNodeIdRemovedCallback.accept(id);
+        }
+        this.recurseRemoveNode(pos);
+    }
+
+
+    IntOpenHashSet getTopLevelNodeIds() {
+        return this.topLevelNodeIds;
+    }
+
+    public void processGeometryResult(BuiltSection sectionResult) {
+        long pos = sectionResult.position;
+        int nodeId = this.activeSectionMap.get(pos);
+        if (nodeId == -1) {
+            sectionResult.free();
+            return;
+        }
+
+        if ((nodeId&NODE_TYPE_MSK)==NODE_TYPE_REQUEST) {
+            if ((nodeId&REQUEST_TYPE_MSK)==REQUEST_TYPE_SINGLE) {
+                var request = this.singleRequests.get(nodeId&NODE_ID_MSK);
+                request.setMesh(this.uploadReplaceSection(request.getMesh(), sectionResult));
+
+                if (!request.hasChildExistenceSet()) {
+                    request.setChildExistence(sectionResult.childExistence);
+                }
+
+                if (request.isSatisfied()) {
+                    this.singleRequests.release(nodeId&NODE_ID_MSK);
+                    this.finishRequest(request);
+                }
+            } else if ((nodeId&REQUEST_TYPE_MSK)==REQUEST_TYPE_CHILD) {
+                var request = this.childRequests.get(nodeId&NODE_ID_MSK);
+                int childId = getChildIdx(pos);
+                request.setChildMesh(childId, this.uploadReplaceSection(request.getChildMesh(childId), sectionResult));
+                if (!request.hasChildChildExistence(childId)) {
+                    request.setChildChildExistence(childId, sectionResult.childExistence);
+                }
+
+                if (request.isSatisfied()) {
+                    this.finishRequest(nodeId&NODE_ID_MSK, request);
+                }
+            } else {
+                throw new IllegalStateException();
+            }
+        } else if ((nodeId&NODE_TYPE_MSK)==NODE_TYPE_INNER || (nodeId&NODE_TYPE_MSK)==NODE_TYPE_LEAF) {
+            nodeId&=NODE_ID_MSK;
+
+
+            if ((this.watcher.get(pos)&UPDATE_TYPE_BLOCK_BIT)==0) {
+                if (this.nodeData.isNodeGeometryInFlight(nodeId)) {
+                    throw new IllegalStateException();
+                }
+                Logger.warn("Recieved geometry update but not watching it, discarding");
+                sectionResult.free();
+                return;
+            }
+
+            this.nodeData.unmarkNodeGeometryInFlight(nodeId);
+            if (this.updateNodeGeometry(nodeId, sectionResult) != 0) {
+                this.invalidateNode(nodeId);
+            }
+        } else {
+            throw new IllegalStateException();
+        }
+    }
+
+    private void removeGeometryCached(long pos, int id) {
+        this.geometryManager.removeSection(id);
+    }
+
+    private int uploadReplaceSection(int meshId, BuiltSection section) {
+        if (section.isEmpty()) {
+            if (meshId != NULL_GEOMETRY_ID && meshId != EMPTY_GEOMETRY_ID) {
+                this.geometryManager.removeSection(meshId);
+            }
+            section.free();
+            return EMPTY_GEOMETRY_ID;
+        }
+        if (meshId != NULL_GEOMETRY_ID && meshId != EMPTY_GEOMETRY_ID) {
+            return this.geometryManager.uploadReplaceSection(meshId, section);
+        }
+        return this.geometryManager.uploadSection(section);
+    }
+
+    private int updateNodeGeometry(int node, BuiltSection geometry) {
+        int previousGeometry = this.nodeData.getNodeGeometry(node);
+        int newGeometry = EMPTY_GEOMETRY_ID;
+        if (previousGeometry != EMPTY_GEOMETRY_ID && previousGeometry != NULL_GEOMETRY_ID) {
+            if (!geometry.isEmpty()) {
+                newGeometry = this.geometryManager.uploadReplaceSection(previousGeometry, geometry);
+            } else {
+                this.geometryManager.removeSection(previousGeometry);
+            }
+        } else {
+            if (!geometry.isEmpty()) {
+                newGeometry = this.geometryManager.uploadSection(geometry);
+            }
+        }
+
+        if (previousGeometry != newGeometry) {
+            this.nodeData.setNodeGeometry(node, newGeometry);
+        }
+        if (previousGeometry == newGeometry) {
+            return 0;
+        } else if (previousGeometry == EMPTY_GEOMETRY_ID || previousGeometry == NULL_GEOMETRY_ID) {
+            return 1;
+        } else {
+            return 2;
+        }
+    }
+
+    public void processChildChange(long pos, byte childExistence) {
+        int nodeId = this.activeSectionMap.get(pos);
+        if (nodeId == -1) {
+            Logger.warn("Got child change for pos " + WorldEngine.pprintPos(pos) + " but it was not in active map, ignoring!");
+            return;
+        }
+
+
+        if ((nodeId&NODE_TYPE_MSK)==NODE_TYPE_REQUEST) {
+            if ((nodeId&REQUEST_TYPE_MSK)==REQUEST_TYPE_SINGLE) {
+                var request = this.singleRequests.get(nodeId&NODE_ID_MSK);
+                request.setChildExistence(childExistence);
+                if (request.isSatisfied()) {
+                    this.singleRequests.release(nodeId&NODE_ID_MSK);
+                    this.finishRequest(request);
+                }
+            } else if ((nodeId&REQUEST_TYPE_MSK)==REQUEST_TYPE_CHILD) {
+                var request = this.childRequests.get(nodeId&NODE_ID_MSK);
+                request.setChildChildExistence(getChildIdx(pos), childExistence);
+                if (request.isSatisfied()) {
+                    this.finishRequest(nodeId&NODE_ID_MSK, request);
+                }
+            } else {
+                throw new IllegalStateException();
+            }
+        } else if ((nodeId&NODE_TYPE_MSK)==NODE_TYPE_INNER) {
+            this.updateChildSectionsInner(pos, nodeId&NODE_ID_MSK, childExistence);
+        } else if ((nodeId&NODE_TYPE_MSK)==NODE_TYPE_LEAF) {
+
+            if (this.nodeData.isNodeRequestInFlight(nodeId&NODE_ID_MSK)) {
+                int requestId = this.nodeData.getNodeRequest(nodeId);
+                var request = this.childRequests.get(requestId);
+                if (request.getPosition() != pos) throw new IllegalStateException("Request is not at pos, got " + WorldEngine.pprintPos(request.getPosition()) + " expected " + WorldEngine.pprintPos(pos));
+                {
+                    byte oldMsk = request.getMsk();
+                    byte change = (byte) (oldMsk ^ childExistence);
+                    {
+                        byte rem = (byte) (change&oldMsk);
+                        for (int i = 0; i < 8; i++) {
+                            if ((rem&(1<<i))==0) continue;
+                            long cPos = makeChildPos(pos, i);
+
+                            int meshId = request.removeAndUnRequire(i);
+                            if (meshId != NULL_GEOMETRY_ID && meshId != EMPTY_GEOMETRY_ID) {
+                                this.removeGeometryCached(cPos, meshId);
+                            }
+
+                            if (this.activeSectionMap.remove(cPos) == -1) {
+                                throw new IllegalStateException("Child pos was in a request but not in active section map");
+                            }
+
+                            if (!this.watcher.unwatch(cPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                                throw new IllegalStateException("Child pos was not being watched");
+                            }
+                        }
+                    }
+
+                    {
+                        byte rem = (byte) (change&childExistence);
+                        for (int i = 0; i < 8; i++) {
+                            if ((rem&(1<<i))==0) continue;
+                            request.addChildRequirement(i);
+
+                            long cPos = makeChildPos(pos, i);
+                            if (this.activeSectionMap.put(cPos, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD) != -1) {
+                                throw new IllegalStateException("Child pos was already in active section tracker but was part of a request");
+                            }
+                            if (!this.watcher.watch(cPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                                throw new IllegalStateException("Child pos update router issue");
+                            }
+                        }
+                    }
+
+                    if (request.isSatisfied()) {
+                        this.finishRequest(requestId, request);
+                    }
+                }
+            }
+
+            this.nodeData.setNodeChildExistence(nodeId&NODE_ID_MSK, childExistence);
+            this.invalidateNode(nodeId&NODE_ID_MSK);
+        }
+    }
+
+    private void updateChildSectionsInner(long pos, int nodeId, byte childExistence) {
+
+        if (childExistence == 0) {
+            Logger.warn("Inner node child existence is changing to 0, this is mild bad");
+        }
+
+        byte existence = this.nodeData.getNodeChildExistence(nodeId);
+
+        byte add = (byte) ((existence^childExistence)&childExistence);
+        if (add != 0) {
+            if (!this.nodeData.isNodeRequestInFlight(nodeId)) {
+                var request = new NodeChildRequest(pos);
+                int requestId = this.childRequests.put(request);
+
+                this.nodeData.markRequestInFlight(nodeId);
+                this.nodeData.setNodeRequest(nodeId, requestId);
+                this.activeNodeRequestCount++;
+            }
+            int requestId = this.nodeData.getNodeRequest(nodeId);
+            var request = this.childRequests.get(requestId);
+            if (request.getPosition() != pos)
+                throw new IllegalStateException("Request is not at pos: got " + WorldEngine.pprintPos(pos) + " expected: " + WorldEngine.pprintPos(request.getPosition()));
+
+            for (int i = 0; i < 8; i++) {
+                if ((add&(1<<i))==0) continue;
+                request.addChildRequirement(i);
+                long cPos = makeChildPos(pos, i);
+                if (this.activeSectionMap.put(cPos, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD) != -1) {
+                    throw new IllegalStateException("Child pos was already in active section tracker but was part of a request");
+                }
+                if (!this.watcher.watch(cPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                    throw new IllegalStateException("Child pos update router issue");
+                }
+            }
+        }
+
+        this.nodeData.setNodeChildExistence(nodeId, childExistence);
+
+        int rem = ((existence^childExistence)&existence)&0xFF;
+        if (rem != 0) {
+            if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+                int requestId = this.nodeData.getNodeRequest(nodeId);
+                var request = this.childRequests.get(requestId);
+                if (request.getPosition() != pos) throw new IllegalStateException("Request is not at pos");
+
+
+                int reqRem =Byte.toUnsignedInt(request.getMsk())&rem;
+                if (reqRem != 0) {
+                    for (int i = 0; i < 8; i++) {
+                        if ((reqRem & (1 << i)) == 0) continue;
+
+                        long cPos = makeChildPos(pos, i);
+
+                        int meshId = request.removeAndUnRequire(i);
+                        if (meshId != NULL_GEOMETRY_ID && meshId != EMPTY_GEOMETRY_ID) {
+                            this.removeGeometryCached(cPos, meshId);
+                        }
+
+                        int cnid = this.activeSectionMap.remove(cPos);
+                        if (cnid == -1 || (cnid&NODE_TYPE_MSK) != NODE_TYPE_REQUEST) {
+                            throw new IllegalStateException("Child pos was in a request but not in active section map");
+                        }
+                        if (!this.watcher.unwatch(cPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                            throw new IllegalStateException("Child pos was not being watched");
+                        }
+                    }
+                }
+                rem ^= reqRem;
+            }
+
+            if (rem != 0) {
+
+
+
+                int oldPtr = this.nodeData.getChildPtr(nodeId);
+                int oldCount = this.nodeData.getChildPtrCount(nodeId);
+                if (oldPtr == -1) {
+                    throw new IllegalStateException();
+                }
+                int oldExistence = 0;
+                for (int i = 0; i < oldCount; i++) {
+                    if (!this.nodeData.nodeExists(i+oldPtr)) throw new IllegalStateException();
+                    oldExistence |= 1<<getChildIdx(this.nodeData.nodePosition(i+oldPtr));
+                }
+
+                if ((rem&oldExistence)!=rem) {
+                    throw new IllegalStateException();
+                }
+
+                int remaining = rem^oldExistence;
+
+                if (remaining == 0) {
+                    if (childExistence != 0 && !this.nodeData.isNodeRequestInFlight(nodeId)) {
+                        throw new IllegalStateException();
+                    }
+
+                    this.nodeData.setAllChildrenAreLeaf(nodeId, false);
+                    this.nodeData.setChildPtr(nodeId, SENTINEL_EMPTY_CHILD_PTR);
+                    this.nodeData.setChildPtrCount(nodeId, 8);
+                    for (int i = 0; i < 8; i++) {
+                        if ((rem&(1<<i))==0) continue;
+                        long cPos = makeChildPos(pos, i);
+                        this.recurseRemoveNode(cPos);
+                    }
+
+                } else {
+
+                    int newCnt = Integer.bitCount(remaining);
+                    int newPtr = this.nodeData.allocate(newCnt);
+                    int prevChildId = oldPtr - 1;
+                    int newChildId = newPtr - 1;
+
+                    boolean allChildNodesLeaf = true;
+                    for (int i = 0; i < 8; i++) {
+                        if ((oldExistence & (1 << i)) == 0) continue;
+                        prevChildId++;
+                        if ((rem & (1 << i)) != 0) {
+                            long cPos = makeChildPos(pos, i);
+                            this.recurseRemoveNode(cPos);
+                        } else {
+                            newChildId++;
+                            long cPos = this.nodeData.nodePosition(prevChildId);
+                            if (cPos != makeChildPos(pos, i)) {
+                                throw new IllegalStateException();
+                            }
+
+                            this.nodeData.copyNode(prevChildId, newChildId);
+
+                            this.clearAllocId(newChildId);
+                            this.clearMoveId(prevChildId, newChildId);
+                            this.clearFreeId(prevChildId);
+
+                            int prevNodeId = this.activeSectionMap.get(cPos);
+                            if ((prevNodeId & NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
+                                throw new IllegalStateException();
+                            }
+                            if ((prevNodeId & NODE_ID_MSK) != prevChildId) {
+                                throw new IllegalStateException("State inconsistency");
+                            }
+                            allChildNodesLeaf &= (prevNodeId & NODE_TYPE_MSK) == NODE_TYPE_LEAF;
+                            this.activeSectionMap.put(cPos, (prevNodeId & NODE_TYPE_MSK) | newChildId);
+
+                            this.nodeData.free(prevChildId);
+                            this.invalidateNode(prevChildId);
+                            this.invalidateNode(newChildId);
+                        }
+                    }
+                    this.nodeData.setAllChildrenAreLeaf(nodeId, allChildNodesLeaf);
+
+                    this.nodeData.setChildPtr(nodeId, newPtr);
+                    this.nodeData.setChildPtrCount(nodeId, newCnt);
+
+                    if (VERIFY_NODE_MANAGER_OPERATIONS) {
+                        for (int i = 0; i < oldCount; i++) {
+                            if (this.nodeData.nodeExists(i + oldPtr)) {
+                                throw new IllegalStateException();
+                            }
+                        }
+                    }
+                }
+
+                this.invalidateNode(nodeId);
+            }
+
+            if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+                int requestId = this.nodeData.getNodeRequest(nodeId);
+                var request = this.childRequests.get(requestId);
+                if (request.getPosition() != pos) throw new IllegalStateException("Request is not at pos");
+
+                if (request.isSatisfied()) {
+                    this.finishRequest(requestId, request);
+                }
+            }
+        }
+
+
+        if (childExistence == 0) {
+            if (this.nodeData.isNodeRequestInFlight(nodeId))
+                throw new IllegalStateException();
+
+            if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) {
+                Logger.error("Transforming inner node to leaf node while it has null geometry");
+                if (!this.nodeData.isNodeGeometryInFlight(nodeId)) {
+                    if ((this.watcher.get(pos) & UPDATE_TYPE_BLOCK_BIT) != 0) {
+                        throw new IllegalStateException("Watcher was already watching for geometry update, but geometry was null");
+                    }
+                    this.processRequest(pos);
+                    if (((this.watcher.get(pos) & UPDATE_TYPE_BLOCK_BIT) == 0)||!this.nodeData.isNodeGeometryInFlight(nodeId)) {
+                        throw new IllegalStateException("Watcher must be watching for geometry update");
+                    }
+                }
+                Logger.error("Setting geometry to EMPTY while request is inflight");
+                this.nodeData.setNodeGeometry(nodeId, EMPTY_GEOMETRY_ID);
+            }
+
+            if (this.nodeData.getChildPtr(nodeId) != SENTINEL_EMPTY_CHILD_PTR) {
+                throw new IllegalStateException();
+            }
+
+            this.nodeData.setChildPtr(nodeId, -1);
+            int old = this.activeSectionMap.put(pos, NODE_TYPE_LEAF|nodeId);
+            this.nodeData.setAllChildrenAreLeaf(nodeId, false);
+            this.invalidateNode(nodeId);
+        }
+    }
+
+    private void recurseRemoveChildNodes(long pos) {
+        this._recurseRemoveNode(pos, true);
+    }
+
+    private void recurseRemoveNode(long pos) {
+        this._recurseRemoveNode(pos, false);
+    }
+
+
+    private void _removeRequest(int reqId, NodeChildRequest req, long pos) {
+        for (int i = 0; i < 8; i++) {
+            if ((req.getMsk()&(1<<i))==0) continue;
+
+            long childPos = makeChildPos(pos, i);
+
+            int meshId = req.getChildMesh(i);
+            if (meshId != EMPTY_GEOMETRY_ID && meshId != NULL_GEOMETRY_ID)
+                this.removeGeometryCached(childPos, meshId);
+
+            int cId = this.activeSectionMap.remove(childPos);
+            if (cId == -1) {
+                throw new IllegalStateException("Child not in activeMap");
+            }
+            if ((cId&NODE_TYPE_MSK) != NODE_TYPE_REQUEST || (cId&REQUEST_TYPE_MSK) != REQUEST_TYPE_CHILD || (cId&NODE_ID_MSK) != reqId) {
+                throw new IllegalStateException("Invalid child active state map: " + cId);
+            }
+            if (!this.watcher.unwatch(childPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                throw new IllegalStateException("Pos was not being watched");
+            }
+        }
+
+        this.childRequests.release(reqId);
+        this.activeNodeRequestCount--;
+    }
+
+    private void _recurseRemoveNode(long pos, boolean onlyRemoveChildren) {
+        int nodeId;
+        if (onlyRemoveChildren) {
+            nodeId = this.activeSectionMap.get(pos);
+        } else {
+            nodeId = this.activeSectionMap.remove(pos);
+        }
+        if (nodeId == -1) {
+            throw new IllegalStateException("Cannot remove pos that doesnt exist");
+        }
+        int type = nodeId&NODE_TYPE_MSK;
+        if (type == NODE_TYPE_INNER || type == NODE_TYPE_LEAF) {
+            nodeId &= NODE_ID_MSK;
+            if (!this.nodeData.nodeExists(nodeId)) {
+                throw new IllegalStateException("Node exists in section map but not in nodeData");
+            }
+
+
+            byte childExistence = this.nodeData.getNodeChildExistence(nodeId);
+            if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+                int reqId = this.nodeData.getNodeRequest(nodeId);
+
+                var req = this.childRequests.get(reqId);
+                childExistence ^= req.getMsk();
+
+                this._removeRequest(reqId, req, pos);
+
+                if (onlyRemoveChildren) {
+                    this.nodeData.unmarkRequestInFlight(nodeId);
+                    this.nodeData.setNodeRequest(nodeId, NULL_REQUEST_ID);
+                }
+            }
+
+
+            if (type == NODE_TYPE_INNER) {
+                if (VERIFY_NODE_MANAGER_OPERATIONS) {
+                    byte msk = 0;
+                    int childPtr = this.nodeData.getChildPtr(nodeId);
+                    if (childPtr == -1) {
+                        throw new IllegalStateException();
+                    }
+                    if (childPtr != SENTINEL_EMPTY_CHILD_PTR) {
+                        int childCnt = this.nodeData.getChildPtrCount(nodeId);
+                        if (Integer.bitCount(Byte.toUnsignedInt(childExistence)) != childCnt) {
+                            throw new IllegalStateException();
+                        }
+                        for (int i = 0; i < childCnt; i++) {
+                            if (!this.nodeData.nodeExists(i + childPtr)) {
+                                throw new IllegalStateException();
+                            }
+                            long cp = this.nodeData.nodePosition(i + childPtr);
+                            if (makeParentPos(cp) != pos) {
+                                throw new IllegalStateException();
+                            }
+                            msk |= (byte) (1 << getChildIdx(cp));
+                        }
+                    }
+                    if (msk != childExistence) {
+                        throw new IllegalStateException();
+                    }
+                }
+
+                for (int i = 0; i < 8; i++) {
+                    if ((childExistence & (1 << i)) == 0) continue;
+
+                    long childPos = makeChildPos(pos, i);
+                    this.recurseRemoveNode(childPos);
+                }
+
+                if (VERIFY_NODE_MANAGER_OPERATIONS) {
+                    int childPtr = this.nodeData.getChildPtr(nodeId);
+                    if (childPtr == -1) {
+                        throw new IllegalStateException();
+                    }
+                    if (childPtr != SENTINEL_EMPTY_CHILD_PTR) {
+                        int childCnt = this.nodeData.getChildPtrCount(nodeId);
+                        if (Integer.bitCount(Byte.toUnsignedInt(childExistence)) != childCnt) {
+                            throw new IllegalStateException();
+                        }
+                        for (int i = 0; i < childCnt; i++) {
+                            if (this.nodeData.nodeExists(i+childPtr)) {
+                                throw new IllegalStateException();
+                            }
+                        }
+                    }
+                }
+                if (onlyRemoveChildren) {
+                    this.nodeData.setChildPtr(nodeId, -1);
+                }
+            }
+
+            if (!onlyRemoveChildren) {
+                int meshId = this.nodeData.getNodeGeometry(nodeId);
+                if (meshId != EMPTY_GEOMETRY_ID && meshId != NULL_GEOMETRY_ID)
+                    this.removeGeometryCached(pos, meshId);
+
+                this.nodeData.free(nodeId);
+                this.clearFreeId(nodeId);
+                this.invalidateNode(nodeId);
+
+                if (!this.watcher.unwatch(pos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                    throw new IllegalStateException("Pos was not being watched");
+                }
+            } else {
+                this.nodeData.setAllChildrenAreLeaf(nodeId, false);
+                this.invalidateNode(nodeId);
+            }
+        } else if (type == NODE_TYPE_REQUEST) {
+            if (!this.watcher.unwatch(pos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                throw new IllegalStateException("Pos was not being watched");
+            }
+            if ((nodeId&REQUEST_TYPE_MSK) == REQUEST_TYPE_SINGLE) {
+                nodeId &= NODE_ID_MSK;
+
+                var req = this.singleRequests.get(nodeId);
+                if (req.getPosition() != pos)
+                    throw new IllegalStateException();
+
+                this.singleRequests.release(nodeId);
+                if (req.hasMeshSet()) {
+                    int meshId = req.getMesh();
+                    if (meshId != EMPTY_GEOMETRY_ID && meshId != NULL_GEOMETRY_ID)
+                        this.removeGeometryCached(pos, meshId);
+                }
+
+            } else {
+                nodeId &= NODE_ID_MSK;
+                var req = this.childRequests.get(nodeId);
+                if (req.getPosition() != pos)
+                    throw new IllegalStateException();
+                this._removeRequest(nodeId, req, pos);
+            }
+        } else {
+            throw new IllegalStateException();
+        }
+    }
+
+    private void finishRequest(SingleNodeRequest request) {
+        int id = this.nodeData.allocate();
+        this.nodeData.setNodePosition(id, request.getPosition());
+        this.nodeData.setNodeGeometry(id, request.getMesh());
+        this.nodeData.setNodeChildExistence(id, request.getChildExistence());
+        this.activeSectionMap.put(request.getPosition(), id|NODE_TYPE_LEAF);
+        this.invalidateNode(id);
+
+
+        if (!this.topLevelNodeIds.add(id)) {
+            throw new IllegalStateException();
+        }
+        this.clearAllocId(id);
+        if (this.topLevelNodeIdAddedCallback != null)
+            this.topLevelNodeIdAddedCallback.accept(id);
+    }
+
+    private void finishRequest(int requestId, NodeChildRequest request) {
+        int parentNodeId = this.activeSectionMap.get(request.getPosition());
+        if (parentNodeId == -1 || (parentNodeId&NODE_TYPE_MSK)==NODE_TYPE_REQUEST) {
+            throw new IllegalStateException("CRITICAL BAD STATE!!! finishRequest tried to finish for a node that no longer exists in the map or has become a request type somehow?!!?!!" + WorldEngine.pprintPos(request.getPosition()) + " " + parentNodeId);
+        }
+        int parentNodeType = parentNodeId&NODE_TYPE_MSK;
+        parentNodeId &= NODE_ID_MSK;
+
+        if (request.getMsk() == 0) {
+
+            this.childRequests.release(requestId);
+
+            this.nodeData.setNodeRequest(parentNodeId, NULL_REQUEST_ID);
+            this.nodeData.unmarkRequestInFlight(parentNodeId);
+            this.activeNodeRequestCount--;
+
+            this.invalidateNode(parentNodeId);
+
+            return;
+        }
+        if (parentNodeType==NODE_TYPE_LEAF) {
+            int msk = Byte.toUnsignedInt(request.getMsk());
+            if (msk == 0) {
+                throw new IllegalStateException();
+            }
+            int base = this.nodeData.allocate(Integer.bitCount(msk));
+            int offset = -1;
+            for (int childIdx = 0; childIdx < 8; childIdx++) {
+                if ((msk&(1<<childIdx)) == 0) {
+                    continue;
+                }
+                offset++;
+
+                long childPos = makeChildPos(request.getPosition(), childIdx);
+                int childNodeId = base+offset;
+                this.nodeData.setNodePosition(childNodeId, childPos);
+                byte childExistence = request.getChildChildExistence(childIdx);
+                if (childExistence == 0) {
+
+
+                    Logger.warn("Request result with child existence of 0, for child pos " + WorldEngine.pprintPos(childPos));
+                }
+                this.nodeData.setNodeChildExistence(childNodeId, childExistence);
+                this.nodeData.setNodeGeometry(childNodeId, request.getChildMesh(childIdx));
+                this.invalidateNode(childNodeId);
+
+                int pid = this.activeSectionMap.put(childPos, childNodeId|NODE_TYPE_LEAF);
+                if ((pid&NODE_TYPE_MSK) != NODE_TYPE_REQUEST) {
+                    throw new IllegalStateException("Put node in map from request but type was not request: " + pid + " " + WorldEngine.pprintPos(childPos));
+                }
+
+                this.clearAllocId(childNodeId);
+            }
+            this.childRequests.release(requestId);
+            this.nodeData.setChildPtr(parentNodeId, base);
+            this.nodeData.setChildPtrCount(parentNodeId, Integer.bitCount(msk));
+            this.nodeData.setNodeRequest(parentNodeId, NULL_REQUEST_ID);
+            this.activeNodeRequestCount--;
+            this.nodeData.unmarkRequestInFlight(parentNodeId);
+
+            if ((this.activeSectionMap.put(request.getPosition(), NODE_TYPE_INNER|parentNodeId)&NODE_TYPE_MSK)!=NODE_TYPE_LEAF) {
+                throw new IllegalStateException();
+            }
+            this.invalidateNode(parentNodeId);
+            this.nodeData.setAllChildrenAreLeaf(parentNodeId, true);
+
+            if (!this.topLevelNodes.contains(request.getPosition())) {
+                int ppnId = this.activeSectionMap.get(makeParentPos(request.getPosition()));
+                if ((ppnId&NODE_TYPE_MSK) != NODE_TYPE_INNER) {
+                    throw new IllegalStateException();
+                }
+                this.nodeData.setAllChildrenAreLeaf(ppnId&NODE_ID_MSK, false);
+            }
+        } else if (parentNodeType==NODE_TYPE_INNER) {
+
+            int oldChildPtr = this.nodeData.getChildPtr(parentNodeId);
+            int oldChildCnt = this.nodeData.getChildPtrCount(parentNodeId);
+            if (oldChildPtr == -1) {
+                throw new IllegalStateException();
+            }
+
+            int existingChildMsk = 0;
+
+            if (oldChildPtr != SENTINEL_EMPTY_CHILD_PTR) {
+
+                for (int i = 0; i < oldChildCnt; i++) {
+                    if (!this.nodeData.nodeExists(i + oldChildPtr)) {
+                        throw new IllegalStateException();
+                    }
+                    existingChildMsk |= 1 << getChildIdx(this.nodeData.nodePosition(i + oldChildPtr));
+                }
+            }
+            int reqMsk = Byte.toUnsignedInt(request.getMsk());
+            if ((byte) (existingChildMsk|reqMsk) != this.nodeData.getNodeChildExistence(parentNodeId)) {
+                    throw new IllegalStateException("node data existence state does not match pointer mask");
+            }
+
+
+            if ((reqMsk&existingChildMsk)!=0) {
+                throw new IllegalStateException("Overlapping child data!!! BAD");
+            }
+
+            int newMsk = reqMsk | existingChildMsk;
+            int newChildPtr = this.nodeData.allocate(Integer.bitCount(newMsk));
+
+            int childId = newChildPtr-1;
+            int prevChildId = oldChildPtr-1;
+
+            for (int i = 0; i < 8; i++) {
+                if ((newMsk&(1<<i))==0) continue;
+                childId++;
+
+                if ((reqMsk&(1<<i))!=0) {
+
+                    long childPos = makeChildPos(request.getPosition(), i);
+
+                    this.nodeData.setNodePosition(childId, childPos);
+                    byte childExistence = request.getChildChildExistence(i);
+                    if (childExistence == 0) {
+
+                    }
+                    this.nodeData.setNodeChildExistence(childId, childExistence);
+                    this.nodeData.setNodeGeometry(childId, request.getChildMesh(i));
+
+                    this.invalidateNode(childId);
+
+                    int pid = this.activeSectionMap.put(childPos, childId|NODE_TYPE_LEAF);
+                    if ((pid&NODE_TYPE_MSK) != NODE_TYPE_REQUEST) {
+                        throw new IllegalStateException("Put node in map from request but type was not request: " + pid + " " + WorldEngine.pprintPos(childPos));
+                    }
+                    this.clearAllocId(childId);
+                } else {
+                    prevChildId++;
+
+                    long pos = this.nodeData.nodePosition(prevChildId);
+
+                    this.nodeData.copyNode(prevChildId, childId);
+
+                    this.clearAllocId(childId);
+                    this.clearMoveId(prevChildId, childId);
+                    this.clearFreeId(prevChildId);
+
+                    int prevNodeId = this.activeSectionMap.get(pos);
+                    if ((prevNodeId&NODE_TYPE_MSK) == NODE_TYPE_REQUEST) {
+                        throw new IllegalStateException();
+                    }
+                    if ((prevNodeId&NODE_ID_MSK) != prevChildId) {
+                        throw new IllegalStateException("State inconsistency");
+                    }
+                    this.activeSectionMap.put(pos, (prevNodeId&NODE_TYPE_MSK)|childId);
+                    this.invalidateNode(prevChildId);
+                    this.invalidateNode(childId);
+                }
+            }
+
+            if (oldChildPtr != SENTINEL_EMPTY_CHILD_PTR) {
+                this.nodeData.free(oldChildPtr, oldChildCnt);
+            }
+
+            if (oldChildPtr == SENTINEL_EMPTY_CHILD_PTR) {
+                this.nodeData.setAllChildrenAreLeaf(parentNodeId, true);
+            }
+
+            this.childRequests.release(requestId);
+
+            this.nodeData.setChildPtr(parentNodeId, newChildPtr);
+            this.nodeData.setChildPtrCount(parentNodeId, Integer.bitCount(newMsk));
+            this.nodeData.setNodeRequest(parentNodeId, NULL_REQUEST_ID);
+            this.activeNodeRequestCount--;
+            this.nodeData.unmarkRequestInFlight(parentNodeId);
+
+            this.invalidateNode(parentNodeId);
+        } else {
+            throw new IllegalStateException();
+        }
+    }
+
+    private int _nodeAlreadyInFlightDontSpam = 1;
+
+    public void processRequest(long pos) {
+        int nodeId = this.activeSectionMap.get(pos);
+        if (nodeId == -1) {
+            return;
+        }
+        int nodeType = nodeId&NODE_TYPE_MSK;
+        nodeId &= NODE_ID_MSK;
+        if (nodeType == NODE_TYPE_REQUEST) {
+            Logger.error("Tried processing request for pos: " + WorldEngine.pprintPos(pos) + " but its type was a request, ignoring!");
+            return;
+        } else if (nodeType != NODE_TYPE_LEAF && nodeType != NODE_TYPE_INNER ) {
+            throw new IllegalStateException("Unknown node type: " + nodeType);
+        }
+
+
+        if (WorldEngine.getLevel(pos) == 0) {
+            Logger.error("Requests cannot exist for bottom level nodes. at: " + WorldEngine.pprintPos(pos) + ". Ignoring request");
+            return;
+        }
+
+        if (nodeType == NODE_TYPE_LEAF) {
+
+            if (this.nodeData.getNodeGeometry(nodeId) == NULL_GEOMETRY_ID) {
+                Logger.warn("Got request for leaf that doesnt have geometry, this should not be possible at pos " + WorldEngine.pprintPos(pos));
+                if (!this.watcher.watch(pos, WorldEngine.UPDATE_TYPE_BLOCK_BIT)) {
+                    Logger.warn("Node: " + nodeId + " at pos: " + WorldEngine.pprintPos(pos) + " got update request, but geometry was already being watched");
+                }
+                return;
+            }
+
+            if (this.nodeData.isNodeRequestInFlight(nodeId)) {
+                if (this._nodeAlreadyInFlightDontSpam>=1 && this._nodeAlreadyInFlightDontSpam<100) {
+                    Logger.warn("Tried processing a node that already has a request in flight: " + nodeId + " pos: " + WorldEngine.pprintPos(pos) + " ignoring");
+                    this._nodeAlreadyInFlightDontSpam++;
+                } else if (this._nodeAlreadyInFlightDontSpam==100) {
+                    Logger.warn("Suppressing \"Tried processing node\" warning ;-; (probably gonna regret this)");
+                    this._nodeAlreadyInFlightDontSpam = 0;
+                }
+                return;
+            }
+
+            this.nodeData.markRequestInFlight(nodeId);
+
+            this.makeLeafChildRequest(nodeId);
+
+        } else {
+            this.processInnerRequest(pos, nodeId);
+        }
+    }
+
+    private void makeLeafChildRequest(int nodeId) {
+        long pos = this.nodeData.nodePosition(nodeId);
+        byte childExistence = this.nodeData.getNodeChildExistence(nodeId);
+
+        if (childExistence == 0) {
+            if (!this.topLevelNodes.contains(pos)) {
+                Logger.warn("Not creating a leaf request with existence mask of 0 at pos", WorldEngine.pprintPos(pos));
+                this.nodeData.unmarkRequestInFlight(nodeId);
+                this.invalidateNode(nodeId);
+                return;
+            }
+        }
+
+        var request = new NodeChildRequest(pos);
+        int requestId = this.childRequests.put(request);
+
+        for (int i = 0; i < 8; i++) {
+            if ((childExistence&(1<<i))==0) {
+                continue;
+            }
+            long childPos = makeChildPos(pos, i);
+            request.addChildRequirement(i);
+
+            int pid = this.activeSectionMap.put(childPos, requestId|NODE_TYPE_REQUEST|REQUEST_TYPE_CHILD);
+
+            if (pid != -1) {
+                String extra = "";
+                if ((pid&NODE_TYPE_MSK)==NODE_TYPE_LEAF) {
+                    extra = " type leaf: pos " + WorldEngine.pprintPos( this.nodeData.nodePosition(pid)) + " hasRequest: " + this.nodeData.isNodeRequestInFlight(pid);
+                }
+                throw new IllegalStateException("Leaf request creation failed to insert child into map as a mapping already existed for the node! pos: " + WorldEngine.pprintPos(childPos) + " id: " + pid + " for parent " + WorldEngine.pprintPos(pos) + " extra " + extra);
+            }
+
+            if (!this.watcher.watch(childPos, WorldEngine.DEFAULT_UPDATE_FLAGS)) {
+                throw new IllegalStateException("Failed to watch childPos");
+            }
+        }
+
+        this.nodeData.setNodeRequest(nodeId, requestId);
+        this.activeNodeRequestCount++;
+    }
+
+    private void processInnerRequest(long pos, int nodeId) {
+        int geo = this.nodeData.getNodeGeometry(nodeId);
+        if (VERIFY_NODE_MANAGER_OPERATIONS) {
+            boolean isWatchingUpdate = (this.watcher.get(pos)&UPDATE_TYPE_BLOCK_BIT)!=0;
+            boolean inflight = this.nodeData.isNodeGeometryInFlight(nodeId);
+            if (inflight && !isWatchingUpdate) {
+                throw new IllegalStateException();
+            }
+            if (geo != NULL_GEOMETRY_ID && inflight) {
+                if (geo != EMPTY_GEOMETRY_ID)
+                    throw new IllegalStateException();
+            }
+        }
+
+        if (!this.nodeData.isNodeGeometryInFlight(nodeId)) {
+            if (!this.watcher.watch(pos, WorldEngine.UPDATE_TYPE_BLOCK_BIT)) {
+                this.invalidateNode(nodeId);
+            } else {
+                this.nodeData.markNodeGeometryInFlight(nodeId);
+            }
+        }
+    }
+
+    public void removeNodeGeometry(long pos) {
+        int nodeId = this.activeSectionMap.get(pos);
+        if (nodeId == -1) {
+            return;
+        }
+        int nodeType = nodeId&NODE_TYPE_MSK;
+        nodeId &= NODE_ID_MSK;
+        if (nodeType == NODE_TYPE_REQUEST) {
+            return;
+        }
+
+        if (nodeType == NODE_TYPE_INNER) {
+            this.clearGeometryInternal(pos, nodeId);
+        } else {
+
+            if (this.topLevelNodes.contains(pos)) {
+                int geo = this.nodeData.getNodeGeometry(nodeId);
+                if (geo == NULL_GEOMETRY_ID || geo == EMPTY_GEOMETRY_ID) {
+                } else {
+                    Logger.warn("Tried removing geometry from top level node which is not allowed, disregarding request");
+                    return;
+                }
+
+            } else {
+                this.processLeafGeometryRemoval(pos);
+            }
+        }
+    }
+
+    private void processLeafGeometryRemoval(long cPos) {
+        long pPos = makeParentPos(cPos);
+        int pId = this.activeSectionMap.get(pPos);
+        if (pId == -1) throw new IllegalStateException("Parent node must exist");
+        if ((pId & NODE_TYPE_MSK) != NODE_TYPE_INNER)
+            throw new IllegalStateException("Parent node must be an inner node");
+        pId &= NODE_ID_MSK;
+
+        if (false) {
+            int cPtr = this.nodeData.getChildPtr(pId);
+            if (cPtr != SENTINEL_EMPTY_CHILD_PTR) {
+                if (cPtr == -1) {
+                    throw new IllegalStateException();
+                }
+                int cCnt = this.nodeData.getChildPtrCount(pId);
+                for (int i = 0; i < cCnt; i++) {
+                    if (!this.nodeData.nodeExists(i+cPtr))
+                        throw new IllegalStateException();
+                    long cp = this.nodeData.nodePosition(i+cPtr);
+                    long cn = this.activeSectionMap.get(cp);
+                    if (cn==-1)
+                        throw new IllegalStateException();
+                    if ((cn&NODE_TYPE_MSK)!=NODE_TYPE_LEAF) {
+
+                        this.clearAllocId(this.activeSectionMap.get(cPos)&NODE_ID_MSK);
+                        return;
+                    }
+                }
+            }
+        }
+
+        int pGeo = this.nodeData.getNodeGeometry(pId);
+        if (pGeo == NULL_GEOMETRY_ID) {
+            this.processRequest(pPos);
+        } else {
+            this.recurseRemoveChildNodes(pPos);
+
+            int old = this.activeSectionMap.put(pPos, NODE_TYPE_LEAF|pId);
+            if (old == -1)
+                throw new IllegalStateException();
+            if ((old&NODE_TYPE_MSK)!=NODE_TYPE_INNER || (old&NODE_ID_MSK)!=pId)
+                throw new IllegalStateException();
+
+            this.nodeData.setAllChildrenAreLeaf(pId, false);
+        }
+    }
+
+    private void clearGeometryInternal(long pos, int nodeId) {
+        int meshId = this.nodeData.getNodeGeometry(nodeId);
+
+        if (meshId != NULL_GEOMETRY_ID && meshId != EMPTY_GEOMETRY_ID) {
+            if (this.watcher.unwatch(pos, WorldEngine.UPDATE_TYPE_BLOCK_BIT)) {
+                throw new IllegalStateException("Unwatching position for geometry removal at: " + WorldEngine.pprintPos(pos) + " resulted in full removal");
+            }
+            this.removeGeometryCached(pos, meshId);
+            this.nodeData.setNodeGeometry(nodeId, NULL_GEOMETRY_ID);
+            this.invalidateNode(nodeId);
+            this.nodeData.unmarkNodeGeometryInFlight(nodeId);
+        } else {
+            if (meshId == NULL_GEOMETRY_ID) {
+            }
+        }
+    }
+
+    public boolean writeChanges(GlBuffer nodeBuffer) {
+        if (this.nodeUpdates.isEmpty()) {
+            return false;
+        }
+        this.nodeUpdates.forEach((int i) -> this.nodeData.writeNode(UploadStream.INSTANCE.upload(nodeBuffer, i*16L, 16L), i));
+        this.nodeUpdates.clear();
+        return true;
+    }
+
+    IntOpenHashSet getNodeUpdates() {
+        return this.nodeUpdates;
+    }
+
+    void writeNode(int node, long address) {
+        this.nodeData.writeNode(address, node);
+    }
+
+    public MemoryBuffer _generateChangeList() {
+        if (this.nodeUpdates.isEmpty()) {
+            return null;
+        }
+        var buff = new MemoryBuffer(this.nodeUpdates.size()*20L);
+        int c = 0;
+        for (int i : this.nodeUpdates) {
+            long addr = buff.address + 20L * c++;
+            MemoryUtil.memPutInt(addr, i);
+            this.nodeData.writeNode(addr+4, i);
+        }
+        this.nodeUpdates.clear();
+        return buff;
+    }
+
+    private void invalidateNode(int nodeId) {
+        this.nodeUpdates.add(nodeId);
+    }
+
+    private static int getChildIdx(long pos) {
+        int x = WorldEngine.getX(pos);
+        int y = WorldEngine.getY(pos);
+        int z = WorldEngine.getZ(pos);
+        return (x&1)|((y&1)<<2)|((z&1)<<1);
+    }
+
+    private static long makeChildPos(long basePos, int addin) {
+        int lvl = WorldEngine.getLevel(basePos);
+        if (lvl == 0) {
+            throw new IllegalArgumentException("Cannot create a child lower than lod level 0");
+        }
+        return WorldEngine.getWorldSectionId(lvl-1,
+                (WorldEngine.getX(basePos)<<1)|(addin&1),
+                (WorldEngine.getY(basePos)<<1)|((addin>>2)&1),
+                (WorldEngine.getZ(basePos)<<1)|((addin>>1)&1));
+    }
+
+    private static long makeParentPos(long pos) {
+        int lvl = WorldEngine.getLevel(pos);
+        if (lvl == MAX_LOD_LAYER) {
+            throw new IllegalArgumentException("Cannot create a parent higher than LoD " + (MAX_LOD_LAYER));
+        }
+        return WorldEngine.getWorldSectionId(lvl+1,
+                WorldEngine.getX(pos)>>1,
+                WorldEngine.getY(pos)>>1,
+                WorldEngine.getZ(pos)>>1);
+    }
+
+    public void addDebug(List<String> debug) {
+        debug.add("NC/IF: " + this.activeSectionMap.size() + "/" + (this.singleRequests.count() + this.childRequests.count()));
+    }
+
+    public int getCurrentMaxNodeId() {
+        return this.nodeData.getEndNodeId();
+    }
+
+
+    private int verifyRequest(long pos, int node, int cActiveExistence, LongOpenHashSet seenPositions, IntOpenHashSet seenNodes) {
+        if (this.nodeData.isNodeRequestInFlight(node)) {
+            int requestId = this.nodeData.getNodeRequest(node);
+            var request = this.childRequests.get(requestId);
+            if (request.getPosition() != pos)
+                throw new IllegalStateException();
+            int reqMsk = Byte.toUnsignedInt(request.getMsk());
+            if ((cActiveExistence&reqMsk)!=0)
+                throw new IllegalStateException();
+            for (int i = 0; i < 8; i++) {
+                if ((reqMsk&(1<<i))==0) continue;
+                long cPos = makeChildPos(pos, i);
+                int cNode = this.activeSectionMap.get(cPos);
+                if (cNode == -1)
+                    throw new IllegalStateException();
+                if ((cNode&NODE_TYPE_MSK)!=NODE_TYPE_REQUEST)
+                    throw new IllegalStateException();
+                if ((cNode&REQUEST_TYPE_MSK)!=REQUEST_TYPE_CHILD)
+                    throw new IllegalStateException();
+                if ((cNode&NODE_ID_MSK) != requestId)
+                    throw new IllegalStateException();
+                this.verifyNode(cPos, seenPositions, seenNodes);
+            }
+            return reqMsk;
+        }
+        return 0;
+    }
+
+    private void verifyNode(long pos, LongOpenHashSet seenPositions, IntOpenHashSet seenNodes) {
+        int node = this.activeSectionMap.get(pos);
+        if (node == -1) {
+            throw new IllegalStateException();
+        }
+        if (this.watcher.get(pos) == 0) {
+            throw new IllegalStateException();
+        }
+        if (!seenPositions.add(pos))
+            throw new IllegalStateException();
+
+        int type = node&NODE_TYPE_MSK;
+        if (type == NODE_TYPE_REQUEST) {
+            if ((node&REQUEST_TYPE_MSK)==REQUEST_TYPE_SINGLE) {
+                if (!this.topLevelNodes.contains(pos)) {
+                    throw new IllegalStateException();
+                }
+                int id = node&NODE_ID_MSK;
+                var req = this.singleRequests.get(id);
+                if (req.getPosition() != pos) {
+                    throw new IllegalStateException();
+                }
+            } else {
+                int id = node&NODE_ID_MSK;
+                var req = this.childRequests.get(id);
+                if (req.getPosition() != makeParentPos(pos)) {
+                    throw new IllegalStateException();
+                }
+            }
+        } else {
+            node &= NODE_ID_MSK;
+            if (!this.nodeData.nodeExists(node)) {
+                throw new IllegalStateException();
+            }
+
+            if (this.nodeData.nodePosition(node) != pos) {
+                throw new IllegalStateException();
+            }
+            if ((this.nodeData.getNodeRequest(node) != NULL_REQUEST_ID) != this.nodeData.isNodeRequestInFlight(node)) {
+                throw new IllegalStateException();
+            }
+            if (this.nodeData.isNodeRequestInFlight(node)) {
+                var req = this.childRequests.get(this.nodeData.getNodeRequest(node));
+                if (req == null) {
+                    throw new IllegalStateException();
+                }
+                if (req.getPosition() != pos) {
+                    throw new IllegalStateException();
+                }
+                if (req.isSatisfied()) {
+                    if (!(type == NODE_TYPE_LEAF && this.topLevelNodes.contains(pos)))
+                        throw new IllegalStateException();
+                }
+            }
+
+            {
+                boolean hasGeometry = this.nodeData.getNodeGeometry(node) != NULL_GEOMETRY_ID;
+                boolean watchingGeo = (this.watcher.get(pos)&UPDATE_TYPE_BLOCK_BIT)!=0;
+                boolean awaitingGeo = this.nodeData.isNodeGeometryInFlight(node);
+                if ((hasGeometry||awaitingGeo) != watchingGeo)
+                    throw new IllegalStateException();
+                if (hasGeometry && awaitingGeo) {
+
+                    if (this.nodeData.getNodeGeometry(node) != EMPTY_GEOMETRY_ID)
+                        throw new IllegalStateException();
+                }
+            }
+            if (!seenNodes.add(node))
+                throw new IllegalStateException();
+            if (type == NODE_TYPE_INNER) {
+                int childPtr = this.nodeData.getChildPtr(node);
+                int childCount = this.nodeData.getChildPtrCount(node);
+                int cActiveExistence = 0;
+
+                if (childPtr == -1) {
+                    throw new IllegalStateException();
+                }
+                if (childPtr != SENTINEL_EMPTY_CHILD_PTR) {
+                    boolean allChildrenLeaf = true;
+                    for (int i = 0; i < childCount; i++) {
+                        if (!this.nodeData.nodeExists(i + childPtr))
+                            throw new IllegalStateException();
+                        long cPos = this.nodeData.nodePosition(i + childPtr);
+                        if (makeParentPos(cPos) != pos)
+                            throw new IllegalStateException();
+                        cActiveExistence |= 1 << getChildIdx(cPos);
+
+                        int cNode = this.activeSectionMap.get(cPos);
+                        if (cNode == -1) {
+                            throw new IllegalStateException();
+                        }
+                        if ((cNode&NODE_TYPE_MSK) != NODE_TYPE_LEAF) {
+                            allChildrenLeaf = false;
+                        }
+                        this.verifyNode(cPos, seenPositions, seenNodes);
+                    }
+
+                    if (this.nodeData.getAllChildrenAreLeaf(node) != allChildrenLeaf) {
+                        throw new IllegalStateException();
+                    }
+                } else {
+                    if (this.nodeData.getAllChildrenAreLeaf(node)) {
+                        throw new IllegalStateException();
+                    }
+                    childCount = 0;
+                }
+
+                int childExistence = cActiveExistence;
+                childExistence |= this.verifyRequest(pos, node, cActiveExistence, seenPositions, seenNodes);
+
+                if (childExistence != Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node))) {
+                    throw new IllegalStateException();
+                }
+
+                if (childExistence == 0) {
+                    throw new IllegalStateException();
+                }
+            } else if (type == NODE_TYPE_LEAF) {
+                if (this.nodeData.getAllChildrenAreLeaf(node)) {
+                    throw new IllegalStateException();
+                }
+
+                if (this.nodeData.getChildPtr(node) != -1) {
+                    throw new IllegalStateException();
+                }
+
+                if (this.nodeData.getNodeGeometry(node) == NULL_GEOMETRY_ID) {
+                    throw new IllegalStateException();
+                }
+
+                if (WorldEngine.getLevel(pos) == 0) {
+                    if (this.nodeData.isNodeRequestInFlight(node)) {
+                        throw new IllegalStateException();
+                    }
+                } else {
+                    if (this.nodeData.isNodeRequestInFlight(node)) {
+                        int childExistence = this.verifyRequest(pos, node, 0, seenPositions, seenNodes);
+                        if (childExistence != Byte.toUnsignedInt(this.nodeData.getNodeChildExistence(node))) {
+                            throw new IllegalStateException();
+                        }
+                    }
+                }
+
+            } else {
+                throw new IllegalStateException();
+            }
+        }
+    }
+
+    public void verifyIntegrity() {
+        this.verifyIntegrity(null, null);
+    }
+    public void verifyIntegrity(LongSet watchingPosSet, IntSet nodes) {
+
+        LongOpenHashSet seenPositions = new LongOpenHashSet();
+        IntOpenHashSet seenNodes = new IntOpenHashSet();
+
+        for (long pos : this.topLevelNodes) {
+            this.verifyNode(pos, seenPositions, seenNodes);
+        }
+
+        var thisMap = this.activeSectionMap.keySet();
+        if (!(seenPositions.containsAll(thisMap)&&thisMap.containsAll(seenPositions))) {
+            throw new IllegalStateException();
+        }
+
+        if (seenNodes.size() != this.nodeData.getNodeCount()) {
+            throw new IllegalStateException();
+        }
+        for (int i : seenNodes) {
+            if (!this.nodeData.nodeExists(i)) {
+                throw new IllegalStateException();
+            }
+        }
+        if (this.activeNodeRequestCount != this.childRequests.count()) {
+            throw new IllegalStateException();
+        }
+        if (watchingPosSet != null) {
+            if (!watchingPosSet.containsAll(thisMap)) {
+                throw new IllegalStateException();
+            }
+            if (!thisMap.containsAll(watchingPosSet)) {
+                throw new IllegalStateException();
+            }
+        }
+        if (nodes != null) {
+            if (!nodes.containsAll(seenNodes)) {
+                throw new IllegalStateException();
+            }
+            if (!seenNodes.containsAll(nodes)) {
+                throw new IllegalStateException();
+            }
+        }
+
+        IntSet tln = new IntOpenHashSet(this.topLevelNodeIds.size());
+        for (long p : this.topLevelNodes) {
+            int n = this.activeSectionMap.get(p);
+            if (n == -1) {
+                throw new IllegalStateException();
+            }
+            if ((n&NODE_TYPE_MSK)!=NODE_TYPE_REQUEST) {
+                if (!tln.add(n&NODE_ID_MSK)) {
+                    throw new IllegalStateException();
+                }
+            }
+        }
+
+        if (!this.topLevelNodeIds.containsAll(tln)) {
+            throw new IllegalStateException();
+        }
+
+        if (!tln.containsAll(this.topLevelNodeIds)) {
+            throw new IllegalStateException();
+        }
+    }
+}

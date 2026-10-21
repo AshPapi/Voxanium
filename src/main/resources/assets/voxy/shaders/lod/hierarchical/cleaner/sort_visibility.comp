@@ -1,0 +1,132 @@
+#version 460 core
+
+layout(local_size_x=WORK_SIZE, local_size_y=1) in;
+#define OPS_PER_THREAD (OUTPUT_SIZE/WORK_SIZE)
+
+#import <voxy:lod/hierarchical/node.glsl>
+
+layout(binding = VISIBILITY_BUFFER_BINDING, std430) restrict readonly buffer VisibilityDataBuffer {
+    uint[] visibility;
+};
+
+layout(binding = OUTPUT_BUFFER_BINDING, std430) restrict volatile buffer MinimumVisibilityBuffer {
+    uint minVisIds[OUTPUT_SIZE];
+};
+
+uint atomicDerefMaxExchangeGlobal(uint atId, uint id) {
+    const uint value = visibility[id];
+    while (true) {
+        const uint existingId = minVisIds[atId];
+        if (existingId == id) {
+            return uint(-1);
+        }
+        if (visibility[existingId&((1u<<31)-1)] <= value) {
+            return id;
+        }
+        const uint c = atomicCompSwap(minVisIds[atId], existingId, id);
+
+        if (c == existingId) {
+            return existingId;
+        }
+    }
+}
+
+void bubbleSortGlobal(uint start, uint id) {
+    for (uint i = start; i < OUTPUT_SIZE; i++) {
+        id = atomicDerefMaxExchangeGlobal(i, id);
+        if (id == uint(-1)) {
+            break;
+        }
+    }
+}
+
+shared uint initalSort[OUTPUT_SIZE];
+
+
+uint atomicDerefMaxExchangeLocal(uint atId, uint id) {
+    const uint value = visibility[id];
+    while (true) {
+        const uint existingId = initalSort[atId];
+        if (existingId == id) {
+            return uint(-1);
+        }
+        if (visibility[existingId&((1u<<31)-1)] <= value) {
+            return id;
+        }
+        const uint c = atomicCompSwap(initalSort[atId], existingId, id);
+
+        if (c == existingId) {
+            return existingId;
+        }
+    }
+}
+void bubbleSortInital(uint vis, uint id) {
+    uint start = 0;
+    if (visibility[initalSort[(OUTPUT_SIZE-1)>>1]] <= vis) {
+        start = (OUTPUT_SIZE-1)>>1;
+    }
+
+    for (uint i = start; i < OUTPUT_SIZE; i++) {
+        id = atomicDerefMaxExchangeLocal(i, id);
+    }
+}
+
+bool shouldSortId(uint id) {
+    UnpackedNode node;
+    if (unpackNode(node, id)==uvec4(-1)) {
+        return false;
+    }
+    if (isEmptyMesh(node) || (!hasMesh(node))) {
+        return false;
+    }
+    if (node.lodLevel == 4) {
+        return false;
+    }
+
+    if (hasRequested(node)) {
+        return false;
+    }
+
+    return true;
+}
+void main() {
+    for (uint i = 0; i < OPS_PER_THREAD; i++) {
+        uint id = (gl_LocalInvocationID.x*OPS_PER_THREAD) + i;
+        initalSort[id] = minVisIds[id]|(1u<<31);
+    }
+    barrier();
+    for (uint i = 0; i < ELEMS_PER_THREAD; i++) {
+        uint id = gl_GlobalInvocationID.x*ELEMS_PER_THREAD+i;
+        uint vis = visibility[id];
+        if (vis == uint(-1)) {
+            continue;
+        }
+        if (visibility[minVisIds[OUTPUT_SIZE-1]] <= vis) {
+            continue;
+        }
+        if (!shouldSortId(id)) {
+            continue;
+        }
+
+        bubbleSortInital(vis, id);
+    }
+    barrier();
+
+    for (uint i = 0; i < OPS_PER_THREAD; i++) {
+        barrier();
+        uint id = (gl_LocalInvocationID.x*OPS_PER_THREAD)+i;
+        uint sid = initalSort[id];
+        if ((sid&(1u<<31)) != 0) {
+            continue;
+        }
+        uint vis = visibility[sid];
+        if (visibility[minVisIds[OUTPUT_SIZE-1]] <= vis) {
+            continue;
+        }
+        uint start = id;
+        if (visibility[minVisIds[(id+OUTPUT_SIZE)>>1]] <= vis) {
+            start = (id+OUTPUT_SIZE)>>1;
+        }
+        bubbleSortGlobal(start, sid);
+    }
+}

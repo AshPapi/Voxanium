@@ -1,0 +1,38 @@
+#version 460 core
+
+layout(local_size_x=128) in;
+
+layout(binding = INPUT_BUFFER_BINDING, std430) restrict readonly buffer InputBuffer {
+    uvec4[] inData;
+};
+
+layout(binding = OUTPUT_BUFFER1_BINDING, std430) restrict writeonly buffer OutputBuffer1 {
+    uvec4[] output1;
+};
+
+layout(binding = OUTPUT_BUFFER2_BINDING, std430) restrict writeonly buffer OutputBuffer2 {
+    uvec4[] output2;
+};
+
+layout(location=0) uniform uint count;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (count <= id) {
+        return;
+    }
+    uint chunkBase = (id>>2u)*5u;
+    uint innerId = id&3u;
+
+    uint writeLocation = inData[chunkBase][innerId];
+    uvec4 writeData = inData[chunkBase+1+innerId];
+
+    uint writeBuffer = writeLocation>>31;
+    writeLocation &= (1u<<31)-1;
+
+    if (writeBuffer == 0) {
+        output1[writeLocation] = writeData;
+    } else {
+        output2[writeLocation] = writeData;
+    }
+}

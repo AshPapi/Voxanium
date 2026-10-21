@@ -1,0 +1,64 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+layout(local_size_x = 128) in;
+
+#define DRAW_BUFFER_BINDING 1
+#define DRAW_COUNT_BUFFER_BINDING 2
+#define SECTION_METADATA_BUFFER_BINDING 3
+#define INDIRECT_SECTION_LOOKUP_BINDING 4
+
+#import <voxy:lod/section.glsl>
+#import <voxy:lod/gl46/bindings.glsl>
+
+layout(binding = TRANSLUCENT_DISTANCE_BUFFER_BINDING, std430) restrict readonly buffer TranslucentCommandCount {
+    uint[] translucentCommandData;
+};
+
+void writeCmd(uint idx, uint instance, uint offset, uint quadCount) {
+    DrawCommand cmd;
+    cmd.count = quadCount * 6;
+    cmd.instanceCount = 1;
+    cmd.firstIndex = 0;
+    cmd.baseVertex = int(offset)<<2;
+    cmd.baseInstance = instance;
+    cmdBuffer[idx] = cmd;
+}
+
+uint getBucket(SectionMeta meta) {
+    uint detail = extractDetail(meta);
+    uvec3 rel = abs(extractPosition(meta)-(baseSectionPos>>detail));
+    uint dist = (rel.x+rel.y+rel.z)<<detail;
+    return (TRANSLUCENT_WRITE_BASE-1)-min(dist, (TRANSLUCENT_WRITE_BASE-1));
+}
+
+int64_t getDistanceKey(SectionMeta meta) {
+    uint detail = extractDetail(meta);
+    i64vec3 centre = i64vec3(((extractPosition(meta)<<detail)-baseSectionPos)<<5) + int64_t(16<<detail) - i64vec3(ivec3(floor(cameraSubPos)));
+    return centre.x*centre.x + centre.y*centre.y + centre.z*centre.z;
+}
+
+void main() {
+    if (gl_GlobalInvocationID.x >= translucentDrawCount) {
+        return;
+    }
+    uint slot = gl_GlobalInvocationID.x;
+    uint drawId = translucentCommandData[SORT_SCRATCH_BASE+slot];
+    uint sectionId = indirectLookup[drawId];
+    SectionMeta meta = sectionData[sectionId];
+
+    uint bucket = getBucket(meta);
+    uint start = bucket == 0 ? 0 : translucentCommandData[bucket-1];
+    uint end = translucentCommandData[bucket];
+
+    int64_t key = getDistanceKey(meta);
+    uint rank = 0;
+    for (uint i = start; i < end; i++) {
+        uint otherId = indirectLookup[translucentCommandData[SORT_SCRATCH_BASE+i]];
+        int64_t otherKey = getDistanceKey(sectionData[otherId]);
+        bool before = otherKey > key || (otherKey == key && (otherId < sectionId || (otherId == sectionId && i < slot)));
+        rank += uint(before);
+    }
+
+    writeCmd(start+rank+TRANSLUCENT_OFFSET, drawId, extractQuadStart(meta), meta.b.x&0xFFFF);
+}

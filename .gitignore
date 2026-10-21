@@ -1,0 +1,16 @@
+# Gradle build files and cache
+.gradle/
+build/
+
+# Minecraft run directory and logs
+run/
+*.log
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Temporary / testing files
+top_crop.png
+sodium_inner.jar

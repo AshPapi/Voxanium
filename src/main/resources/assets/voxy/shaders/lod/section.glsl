@@ -1,0 +1,29 @@
+#import <voxy:lod/pos_util.glsl>
+struct SectionMeta {
+    uvec4 a;
+    uvec4 b;
+};
+
+uvec2 extractRawPos(SectionMeta section) {
+    return section.a.xy;
+}
+
+uint extractDetail(SectionMeta section) {
+    return getLoDLevel(section.a.xy);
+}
+
+ivec3 extractPosition(SectionMeta section) {
+    return getLoDPosition(section.a.xy);
+}
+
+uint extractQuadStart(SectionMeta meta) {
+    return meta.a.w;
+}
+
+ivec3 extractAABBOffset(SectionMeta meta) {
+    return (ivec3(meta.a.z)>>ivec3(0,5,10))&31;
+}
+
+ivec3 extractAABBSize(SectionMeta meta) {
+    return ((ivec3(meta.a.z)>>ivec3(15,20,25))&31)+1;
+}

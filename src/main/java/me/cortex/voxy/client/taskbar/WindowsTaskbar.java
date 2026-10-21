@@ -1,0 +1,69 @@
+package me.cortex.voxy.client.taskbar;
+
+import com.sun.jna.Pointer;
+import com.sun.jna.platform.win32.COM.COMInvoker;
+import com.sun.jna.platform.win32.*;
+import com.sun.jna.ptr.PointerByReference;
+
+import static org.lwjgl.sdl.SDLProperties.SDL_GetPointerProperty;
+import static org.lwjgl.sdl.SDLVideo.SDL_GetWindowProperties;
+import static org.lwjgl.sdl.SDLVideo.SDL_PROP_WINDOW_WIN32_HWND_POINTER;
+
+public class WindowsTaskbar extends COMInvoker implements Taskbar.ITaskbar {
+    private final WinDef.HWND hwnd;
+    WindowsTaskbar(long windowId) {
+        var itaskbar3res = new PointerByReference();
+
+        if (W32Errors.FAILED(Ole32.INSTANCE.CoCreateInstance(new Guid.GUID("56FDF344-FD6D-11d0-958A-006097C9A090"),
+                null,
+                WTypes.CLSCTX_SERVER,
+                new Guid.GUID("EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF"),
+                itaskbar3res))) {
+            throw new IllegalStateException("Failed to create ITaskbar3");
+        }
+
+        this.setPointer(itaskbar3res.getValue());
+        this.hwnd = new WinDef.HWND(new Pointer(SDL_GetPointerProperty(SDL_GetWindowProperties(windowId), SDL_PROP_WINDOW_WIN32_HWND_POINTER, 0)));
+        this.invokeNative(3);
+    }
+
+    private void invokeNative(int ventry, Object... objects) {
+        Object[] args = new Object[objects.length+1];
+        args[0] = this.getPointer();
+        System.arraycopy(objects, 0, args, 1, objects.length);
+        if (W32Errors.FAILED((WinNT.HRESULT) this._invokeNativeObject(ventry, args, WinNT.HRESULT.class))) {
+            throw new IllegalStateException("Failed to invoke vtable: " + ventry);
+        }
+    }
+
+    public void close() {
+        this.invokeNative(10, this.hwnd, 0);
+        this.invokeNative(2);
+        this.setPointer(null);
+    }
+
+    @Override
+    public void setIsNone() {
+        this.invokeNative(10, this.hwnd, 0);
+    }
+
+    @Override
+    public void setProgress(long count, long outOf) {
+        this.invokeNative(9, this.hwnd, count, outOf);
+    }
+
+    @Override
+    public void setIsPaused() {
+        this.invokeNative(10, this.hwnd, 8);
+    }
+
+    @Override
+    public void setIsProgression() {
+        this.invokeNative(10, this.hwnd, 2);
+    }
+
+    @Override
+    public void setIsError() {
+        this.invokeNative(10, this.hwnd, 2);
+    }
+}

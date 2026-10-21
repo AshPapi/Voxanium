@@ -1,0 +1,46 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+layout(local_size_x = 128) in;
+
+#define DRAW_BUFFER_BINDING 1
+#define DRAW_COUNT_BUFFER_BINDING 2
+#define SECTION_METADATA_BUFFER_BINDING 3
+#define INDIRECT_SECTION_LOOKUP_BINDING 4
+
+#import <voxy:lod/section.glsl>
+#import <voxy:lod/gl46/bindings.glsl>
+
+layout(binding = TRANSLUCENT_DISTANCE_BUFFER_BINDING, std430) restrict buffer TranslucentCommandCount {
+    uint[] translucentCommandData;
+};
+
+void writeCmd(uint idx, uint instance, uint offset, uint quadCount) {
+    DrawCommand cmd;
+    cmd.count = quadCount * 6;
+    cmd.instanceCount = 1;
+    cmd.firstIndex = 0;
+    cmd.baseVertex = int(offset)<<2;
+    cmd.baseInstance = instance;
+    cmdBuffer[idx] = cmd;
+}
+
+void main() {
+    if (gl_GlobalInvocationID.x >= translucentDrawCount) {
+        return;
+    }
+    uint drawId = translucentCommandData[gl_GlobalInvocationID.x+TRANSLUCENT_WRITE_BASE];
+    SectionMeta meta = sectionData[indirectLookup[drawId]];
+    uint detail = extractDetail(meta);
+
+    uvec3 rel = abs(extractPosition(meta)-(baseSectionPos>>detail));
+    uint dist = (rel.x+rel.y+rel.z)<<detail;
+    dist = (TRANSLUCENT_WRITE_BASE-1)-min(dist, (TRANSLUCENT_WRITE_BASE-1));
+
+    uint drawPtr = atomicAdd(translucentCommandData[dist],1);
+    #ifdef SORT_SCRATCH_BASE
+    translucentCommandData[SORT_SCRATCH_BASE+drawPtr] = drawId;
+    #else
+    writeCmd(drawPtr+TRANSLUCENT_OFFSET, drawId, extractQuadStart(meta), meta.b.x&0xFFFF);
+    #endif
+}
